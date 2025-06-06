@@ -22,6 +22,7 @@ ALLOWED_USERS = [int(user_id) for user_id in os.getenv('ALLOWED_USERS', '').spli
 
 active_sessions = {}
 categories = ['💼 Работа', '🏋️ Спорт', '🌴 Отдых', '📚 Учёба', '🔧 Другое']
+awaiting_category = {}
 awaiting_activity_name = {}
 awaiting_custom_interval = {}
 goals_file = os.getenv('GOALS_FILE', 'goals.json')
@@ -68,10 +69,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = get_main_menu(user_id)
     best = record.get(str(user_id), "ещё нет")
     if user_id in active_sessions:
-        activity_name, category, start_time = active_sessions[user_id]
+        start_time = active_sessions[user_id]
         message_text = (
-            f"👋 Привет! У тебя уже запущена активность:\n\n"
-            f"📅 *{activity_name}* ({category})\n"
+            f"👋 Привет! У тебя уже запущена активность.\n\n"
             f"🕒 Начата: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             f"🏆 Личный рекорд: {best}\n\n"
             "Выбери действие:"
@@ -83,8 +83,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.data
     if user_id in active_sessions:
-        activity_name, category, start_time = active_sessions[user_id]
-        await context.bot.send_message(chat_id=user_id, text=f"🔔 Напоминание: ты всё ещё работаешь над '{activity_name}' ({category}).")
+        await context.bot.send_message(chat_id=user_id, text="🔔 Напоминание: активность всё ещё продолжается.")
     else:
         await context.bot.send_message(chat_id=user_id, text="🔔 Пора начать новую активность!")
 
@@ -101,48 +100,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if query.data == "start_activity":
-            keyboard = [[InlineKeyboardButton(cat, callback_data=f"cat_{cat}")] for cat in categories]
-            await query.edit_message_text("Выберите категорию:", reply_markup=InlineKeyboardMarkup(keyboard))
+            if user_id in active_sessions:
+                await query.edit_message_text("❗️ Активность уже запущена.", reply_markup=get_main_menu(user_id))
+            else:
+                active_sessions[user_id] = current_time
+                await query.edit_message_text(
+                    "✅ Активность начата! Нажмите \"Завершить активность\" когда закончите.",
+                    reply_markup=get_main_menu(user_id)
+                )
+                minutes = user_intervals.get(str(user_id), 30)
+                context.job_queue.run_repeating(send_reminder, interval=minutes*60, first=minutes*60, name=f"reminder_{user_id}", data=user_id)
 
         elif query.data.startswith("cat_"):
-            category = query.data.split("_")[1]
-            context.user_data['category'] = category
-            awaiting_activity_name[user_id] = True
-            await query.edit_message_text(f"Категория выбрана: {category}. Введите название активности:")
+            category = query.data.split("_", 1)[1]
+            if awaiting_category.get(user_id):
+                context.user_data['category'] = category
+                awaiting_category.pop(user_id)
+                awaiting_activity_name[user_id] = True
+                await query.edit_message_text(f"Категория выбрана: {category}. Введите название активности:")
+            else:
+                await query.edit_message_text("❗️ Неожиданный выбор категории.", reply_markup=get_main_menu(user_id))
 
         elif query.data == "stop_activity":
             if user_id in active_sessions:
-                activity_name, category, start_time = active_sessions.pop(user_id)
+                start_time = active_sessions.pop(user_id)
                 end_time = current_time
-                duration_seconds = int((end_time - start_time).total_seconds())
-                minutes, seconds = divmod(duration_seconds, 60)
-                duration_formatted = f"{minutes}:{seconds:02d}"
-
-                worksheet.append_row([activity_name, category, str(start_time), str(end_time), duration_formatted])
-
-                old_record = record.get(str(user_id), 0)
-                if duration_seconds > float(old_record):
-                    record[str(user_id)] = duration_seconds
-                    save_json(record_file, record)
-                    record_text = "🏆 Это новый рекорд!"
-                else:
-                    record_text = f"🏆 Личный рекорд: {old_record} сек"
-
-                await query.edit_message_text(
-                    f"✅ Активность '{activity_name}' завершена.\nДлительность: {duration_formatted}\n{record_text}",
-                    reply_markup=get_main_menu(user_id)
-                )
+                context.user_data['start_time'] = start_time
+                context.user_data['end_time'] = end_time
+                awaiting_category[user_id] = True
                 jobs = context.job_queue.get_jobs_by_name(f"reminder_{user_id}")
                 for job in jobs:
                     job.schedule_removal()
+                keyboard = [[InlineKeyboardButton(cat, callback_data=f"cat_{cat}")] for cat in categories]
+                await query.edit_message_text(
+                    "Выберите категорию завершённой активности:",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
             else:
                 await query.edit_message_text("❌ Нет активной активности.", reply_markup=get_main_menu(user_id))
 
         elif query.data == "current_activity":
             if user_id in active_sessions:
-                activity_name, category, start_time = active_sessions[user_id]
+                start_time = active_sessions[user_id]
                 await query.edit_message_text(
-                    f"📅 Текущая активность:\n- {activity_name} ({category}) с {start_time}",
+                    f"📅 Активность начата в {start_time}",
                     reply_markup=get_main_menu(user_id)
                 )
             else:
@@ -209,14 +210,30 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['awaiting_goal'] = False
         await update.message.reply_text(f"🎯 Цель установлена: {goal}", reply_markup=get_main_menu(user_id))
     elif awaiting_activity_name.get(user_id):
-        category = context.user_data.get('category', 'Другое')
         activity_name = update.message.text.strip()
-        start_time = datetime.datetime.now()
-        active_sessions[user_id] = (activity_name, category, start_time)
+        category = context.user_data.get('category', 'Другое')
+        start_time = context.user_data.pop('start_time', datetime.datetime.now())
+        end_time = context.user_data.pop('end_time', datetime.datetime.now())
         awaiting_activity_name.pop(user_id)
-        await update.message.reply_text(f"✅ Активность '{activity_name}' в категории '{category}' начата!", reply_markup=get_main_menu(user_id))
-        minutes = user_intervals.get(str(user_id), 30)
-        context.job_queue.run_repeating(send_reminder, interval=minutes*60, first=minutes*60, name=f"reminder_{user_id}", data=user_id)
+
+        duration_seconds = int((end_time - start_time).total_seconds())
+        minutes, seconds = divmod(duration_seconds, 60)
+        duration_formatted = f"{minutes}:{seconds:02d}"
+
+        worksheet.append_row([activity_name, category, str(start_time), str(end_time), duration_formatted])
+
+        old_record = record.get(str(user_id), 0)
+        if duration_seconds > float(old_record):
+            record[str(user_id)] = duration_seconds
+            save_json(record_file, record)
+            record_text = "🏆 Это новый рекорд!"
+        else:
+            record_text = f"🏆 Личный рекорд: {old_record} сек"
+
+        await update.message.reply_text(
+            f"✅ Активность '{activity_name}' завершена.\nДлительность: {duration_formatted}\n{record_text}",
+            reply_markup=get_main_menu(user_id)
+        )
     elif awaiting_custom_interval.get(user_id):
         try:
             minutes = int(update.message.text.strip())
