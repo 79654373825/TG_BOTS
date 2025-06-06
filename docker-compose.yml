@@ -1,0 +1,24 @@
+
+services:
+  time-tracker-bot:
+    container_name: time-tracker-bot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      - TZ=Europe/Moscow
+      - PYTHONUNBUFFERED=1
+    command: python bot.py
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe')", "||", "exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
